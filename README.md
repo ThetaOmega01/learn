@@ -1,39 +1,65 @@
 # learn
 
-[![video](assets/thumbnail.png)](https://www.youtube.com/watch?v=kzcI5F4tGiU)
+A personal learning system for [omp](https://github.com/can1357/oh-my-pi): a teaching skill, a few extensions, and subagent definitions. It does long-horizon study of a book or lecture notes one chapter per session, plus quick sprints on topics needed at work. Each session ends in linked Obsidian review notes, and spaced repetition keeps those notes alive.
 
-My AI learning system from this video: [How I Use AI to Learn Things](https://www.youtube.com/watch?v=kzcI5F4tGiU).
+Forked from [amosblomqvist/learn](https://github.com/amosblomqvist/learn), built for the video [How I Use AI to Learn Things](https://www.youtube.com/watch?v=kzcI5F4tGiU).
 
-This is a personal system I built for myself, shared as-is. Built as a pi configuration: the teaching philosophy encoded in a skill, a few small extensions, and agent definitions.
+## How it works
 
-## What's in it
+The repo root has the layout of an omp config directory, so a project uses it by linking `<project>/.omp` to this repo.
 
-- `skills/teach/` — the philosophy and the process
-- `skills/visualize/` — adds a correct, minimal diagram to a lesson when an idea is clearer as a picture
-- `extensions/ask-user-question/` — the agent asks you questions through a UI popup
-- `extensions/quiz/` — graded questions with instant feedback (✓/✗, correct answer, explanation)
-- `extensions/md-log/` — link a markdown file to the session
-- `extensions/visual-tools/` — tools for visualization subagents
-- `agents/` — `researcher`, `svg-maker`, `mermaid-maker`: the subagents the system delegates to
+- `skills/teach/`: the pedagogy (unconditional truths first; "how could I have discovered this?") and the session procedures. `SKILL.md` is the short core; the mode and format files load only when needed.
+- `skills/visualize/`: adds one verified diagram (Mermaid) or figure (SVG) to a lesson.
+- `extensions/quiz.ts`: `quiz`, a graded multiple-choice tool with instant feedback. Questions tagged with a `concept` are logged for review.
+- `extensions/learn/`: `learn_due` and `learn_commit` (Leitner boxes, 1/3/7/14/30 days), plus the `/wrap` and `/review` commands.
+- `extensions/visual-tools/`: write, edit, and render tools for Mermaid and SVG. Only the maker agents see them.
+- `agents/`: `researcher` (fact checks, topic scoping), `mermaid-maker`, `svg-maker`.
 
-## Install
+Non-graded questions use omp's built-in `ask` tool.
 
-This repo **is** a `.pi` directory. From your learning project's root:
+## Setup
+
+Requirements: omp, Bun, Google Chrome (renders previews), Node (runs the installed `mmdc`).
 
 ```bash
-git clone https://github.com/amosblomqvist/learn .pi
+cd extensions/visual-tools && bun install   # mermaid-cli for Mermaid previews
 ```
 
-Then open pi in that directory. (Or copy the pieces you want into your existing project config.)
+Create a course project, which is also an Obsidian vault:
 
-## Requirements
+```bash
+scripts/new-course.sh ~/workspace/local/learn-os ~/Downloads/ostep.pdf
+cd ~/workspace/local/learn-os && omp
+```
 
-- [pi](https://github.com/earendil-works/pi)
-- A subagent implementation, so the system can spawn the researcher and the visual makers. Recommended: [pi-interactive-subagents](https://github.com/amosblomqvist/pi-interactive-subagents) (tmux only). With it, everything works out of the box. Any other implementation works too, but expect to adapt the agent definitions, e.g. `agents/researcher.md` lists `safe_bash` in its tools, which is specific to that extension.
-- `ask-user-question` — use the copy bundled here. If your setup already has an `ask-user-question` extension, use **this** one in its place. Popups from different extensions serialize through a shared UI lock, which only works when it's the same implementation.
+The first session builds `COURSE.md` (goal and syllabus) from the source and asks you to confirm it. For an existing directory, the script only adds the `.omp` link and `review.base`. If a `.omp` already exists and points somewhere else, the script stops and leaves it alone.
 
-## Notes
+The learner profile lives in `~/.omp/agent/learner/` (`INDEX.md` plus one file per domain). It is shared across all projects and created through a short interview on the first run.
 
-You can run the system without subagents. The main session does the teaching. You just lose the researcher (truth verification) and the generated visuals.
+## Use
 
-The teaching skill is written for one learner (me). Edit the skill to fit how you learn best.
+| You say | What happens |
+|---|---|
+| "I want to learn chapter 3 today" | Course session: time budget → warm-up review → probe → plan (dependency map; waits for your OK) → teach loop with a quiz per concept → practice task sized to the budget |
+| "I read chapter 3" | Same session, but it consolidates what you read instead of teaching from scratch |
+| "I need X for <work task>" | Sprint: probes only what the task needs, short plan, teach, then apply it to your real problem |
+| `/review [n]` | Review-only session on concepts due for spaced repetition |
+| `/wrap` | Writes concept, chapter, and sprint notes; commits quiz results to the review schedule; updates `COURSE.md` and your profile |
+
+If a session ends without `/wrap`, the next session start warns you and offers to finish it.
+
+## Project layout
+
+```
+<project>/
+  .omp -> this repo
+  COURSE.md            goal, syllabus, session log
+  sources/             book / lecture notes
+  chapters/            one index note per chapter (concept map + links)
+  concepts/            one note per concept; review state in frontmatter
+  sprints/             sprint cheat sheets
+  practice/            exercises
+  assets/              SVG figures
+  review.base          Obsidian table of concepts due for review
+  .learn/              quiz log (machine state)
+```

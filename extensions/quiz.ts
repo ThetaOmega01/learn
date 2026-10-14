@@ -1,26 +1,31 @@
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { appendFileSync, mkdirSync } from "node:fs";
+import { join } from "node:path";
+import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import {
 	Editor,
-	type EditorTheme,
+	getEditorTheme,
 	Key,
 	Text,
 	matchesKey,
 	truncateToWidth,
 	wrapTextWithAnsi,
-} from "@mariozechner/pi-tui";
-import { Type } from "@sinclair/typebox";
+} from "@oh-my-pi/pi-tui";
 
 // ────────────────────────────────────────────────────────────────────────────
-// quiz — a GRADED sibling of ask_user_question.
+// quiz — a GRADED sibling of omp's built-in `ask`.
 //
-// Where ask_user_question collects a preference/decision with no notion of
-// right or wrong, `quiz` poses a question that HAS a correct answer, grades the
-// user's selection instantly, and shows tight feedback (✓/✗ + the correct
-// answer + an optional explanation) to both the user and the agent.
+// Where `ask` collects a preference/decision with no notion of right or wrong,
+// `quiz` poses a question that HAS a correct answer, grades the user's
+// selection instantly, and shows tight feedback (✓/✗ + the correct answer +
+// an optional explanation) to both the user and the agent.
 //
 // It is intentionally options-only: single-select or multi-select. There is no
 // free-text mode and no "Other" option, because a free-text answer can't be
 // graded against a correct index.
+//
+// A quiz tagged with `concept` (a concept-note slug) is appended to
+// <cwd>/.learn/quiz-log.jsonl; the learn extension's `learn_commit` turns that
+// log into Leitner-box review state on the concept notes.
 // ────────────────────────────────────────────────────────────────────────────
 
 interface QuizOption {
@@ -81,44 +86,74 @@ interface QuizResultDetails {
 	message?: string;
 }
 
-const OptionSchema = Type.Object({
-	label: Type.String({ description: "Display label for the answer option." }),
-	value: Type.Optional(
-		Type.String({ description: "Optional machine-readable value returned for the option. Defaults to the label." }),
-	),
-	description: Type.Optional(Type.String({ description: "Optional extra detail shown below the option." })),
-});
-
-const QuizParams = Type.Object({
-	question: Type.String({
-		description: "The single quiz question to ask. Ask exactly one question per tool call.",
-	}),
-	details: Type.Optional(
-		Type.String({ description: "Optional extra context or instructions shown under the question." }),
-	),
-	options: Type.Array(OptionSchema, {
-		description:
-			"The answer options (2 or more). Options only — there is no free-text mode. Give each option a stable `value`; you reference the correct one by that value in correctAnswer.",
-		minItems: 2,
-	}),
-	multiSelect: Type.Optional(
-		Type.Boolean({ description: "Set to true when more than one option is correct and the user must select all of them." }),
-	),
-	correctAnswer: Type.Union([Type.String(), Type.Array(Type.String())], {
-		description:
-			'REQUIRED. The correct answer as the option value(s) — the `value` field of the option you intend. Single-select: a single string (e.g. "mercury"). Multi-select: an array of strings (e.g. ["belize", "niue"]); the user is only correct if their selection matches this set exactly. Always pass the value, not a position number — this is self-checking and prevents miscounting.',
-	}),
-	explanation: Type.String({
-		description:
-			"REQUIRED. Explanation revealed AFTER the user answers (shown whether they got it right or wrong). Use it to reinforce why the correct answer is correct.",
-	}),
-	shuffle: Type.Optional(
-		Type.Boolean({
-			description:
+// Built from the host-injected zod-compatible builder (pi.zod) at registration.
+function quizParams(z: ExtensionAPI["zod"]) {
+	const option = z.object({
+		label: z.string().describe("Display label for the answer option."),
+		value: z
+			.string()
+			.optional()
+			.describe("Optional machine-readable value returned for the option. Defaults to the label."),
+		description: z.string().optional().describe("Optional extra detail shown below the option."),
+	});
+	return z.object({
+		question: z.string().describe("The single quiz question to ask. Ask exactly one question per tool call."),
+		details: z.string().optional().describe("Optional extra context or instructions shown under the question."),
+		options: z
+			.array(option)
+			.min(2)
+			.describe(
+				"The answer options (2 or more). Options only — there is no free-text mode. Give each option a stable `value`; you reference the correct one by that value in correctAnswer.",
+			),
+		multiSelect: z
+			.boolean()
+			.optional()
+			.describe("Set to true when more than one option is correct and the user must select all of them."),
+		correctAnswer: z
+			.union([z.string(), z.array(z.string())])
+			.describe(
+				'REQUIRED. The correct answer as the option value(s) — the `value` field of the option you intend. Single-select: a single string (e.g. "mercury"). Multi-select: an array of strings (e.g. ["belize", "niue"]); the user is only correct if their selection matches this set exactly. Always pass the value, not a position number — this is self-checking and prevents miscounting.',
+			),
+		explanation: z
+			.string()
+			.describe(
+				"REQUIRED. Explanation revealed AFTER the user answers (shown whether they got it right or wrong). Use it to reinforce why the correct answer is correct.",
+			),
+		shuffle: z
+			.boolean()
+			.optional()
+			.describe(
 				"Defaults to true: options are randomly reordered before display so the correct answer isn't always in the same position. Set to false only when option order is meaningful (e.g. ordered numeric values, or an 'All/None of the above' option that must stay last).",
-		}),
-	),
-});
+			),
+		concept: z
+			.string()
+			.optional()
+			.describe(
+				"Concept-note slug (kebab-case, e.g. 'borrow-checker') when this question checks one concept from the lesson. Tagged results feed spaced-repetition review. Omit for probe questions that map the learner's level.",
+			),
+	});
+}
+
+// Append a tagged result to <cwd>/.learn/quiz-log.jsonl. "I don't know" counts
+// as a miss for scheduling. Logging failures surface in the tool result text
+// rather than failing the quiz the user already answered.
+function logConceptResult(cwd: string, concept: string, details: QuizResultDetails): string | undefined {
+	const entry = {
+		ts: new Date().toISOString(),
+		concept,
+		correct: details.correct === true && !details.dontKnow,
+		dontKnow: details.dontKnow === true,
+		question: details.question,
+	};
+	try {
+		const dir = join(cwd, ".learn");
+		mkdirSync(dir, { recursive: true });
+		appendFileSync(join(dir, "quiz-log.jsonl"), `${JSON.stringify(entry)}\n`, "utf8");
+		return undefined;
+	} catch (e) {
+		return `WARNING: failed to log result for concept "${concept}": ${(e as Error).message}`;
+	}
+}
 
 function normalizeOptions(
 	options: Array<{ label: string; value?: string; description?: string }> | undefined,
@@ -192,19 +227,6 @@ function resolveCorrect(
 		indices.push(idx);
 	}
 	return { indices: Array.from(new Set(indices)).sort((a, b) => a - b) };
-}
-
-function createEditorTheme(theme: any): EditorTheme {
-	return {
-		borderColor: (s) => theme.fg("accent", s),
-		selectList: {
-			selectedPrefix: (t) => theme.fg("accent", t),
-			selectedText: (t) => theme.fg("accent", t),
-			description: (t) => theme.fg("muted", t),
-			scrollInfo: (t) => theme.fg("dim", t),
-			noMatch: (t) => theme.fg("warning", t),
-		},
-	};
 }
 
 function addWrapped(lines: string[], text: string, width: number, indent = ""): void {
@@ -406,13 +428,14 @@ function pushNoteField(lines: string[], theme: any, width: number, editor: Edito
 	for (const line of editor.render(width)) lines.push(line);
 }
 
-// Build the note Editor. `disableSubmit` is set because Enter must NOT submit
-// here: the editor's submit path clears the buffer, which would wipe the note.
-// Instead the host intercepts Enter to return focus to the options while
-// keeping the text. Ctrl+J still inserts a newline (pi convention), so
+// Build the note Editor with the host's editor theme (it carries the symbol
+// set the omp Editor renders with). `disableSubmit` is set because Enter must
+// NOT submit here: the editor's submit path clears the buffer, which would
+// wipe the note. Instead the host intercepts Enter to return focus to the
+// options while keeping the text. Ctrl+J still inserts a newline, so
 // multi-line notes work.
-function makeNoteEditor(tui: any, theme: any): Editor {
-	const editor = new Editor(tui, createEditorTheme(theme));
+function makeNoteEditor(): Editor {
+	const editor = new Editor(getEditorTheme());
 	editor.focused = false;
 	editor.disableSubmit = true;
 	return editor;
@@ -440,7 +463,7 @@ async function askSingleChoice(
 			let focus: "options" | "note" = "options";
 			let chosen: OptionAnswer | null = null;
 			let dontKnow = false;
-			const editor = makeNoteEditor(tui, theme);
+			const editor = makeNoteEditor();
 			let cachedLines: string[] | undefined;
 			let cachedWidth = -1;
 
@@ -626,7 +649,7 @@ async function askMultiChoice(
 			let optionIndex = 0;
 			let phase: "select" | "feedback" = "select";
 			let focus: "options" | "note" = "options";
-			const editor = makeNoteEditor(tui, theme);
+			const editor = makeNoteEditor();
 			let cachedLines: string[] | undefined;
 			let cachedWidth = -1;
 			const selected = new Map<string, OptionAnswer>();
@@ -846,59 +869,43 @@ function sortAnswers(answers: OptionAnswer[]): OptionAnswer[] {
 	return [...answers].sort((a, b) => a.index - b.index);
 }
 
-// Shared UI mutex. ctx.ui.custom()/editor can only handle one active call at
-// a time, so ALL pop-up-style tools (quiz, ask_user_question, ...) must
-// serialize against each other, not just against themselves. We stash one
-// mutex on globalThis so separate extension files can share it without
-// importing each other.
-const SHARED_UI_LOCK_KEY = "__piSharedUiLock";
-function getSharedUiLock() {
-	const g = globalThis as any;
-	if (!g[SHARED_UI_LOCK_KEY]) {
-		let chain: Promise<void> = Promise.resolve();
-		g[SHARED_UI_LOCK_KEY] = {
-			withLock<T>(fn: () => T | Promise<T>): Promise<T> {
-				const prev = chain;
-				let release: () => void;
-				chain = new Promise<void>((r) => { release = r; });
-				return prev.then(fn).finally(() => release!());
-			},
-		};
-	}
-	return g[SHARED_UI_LOCK_KEY] as { withLock<T>(fn: () => T | Promise<T>): Promise<T> };
-}
-const sharedUiLock = getSharedUiLock();
-
+// ctx.ui.custom() can only drive one overlay at a time, so concurrent quiz
+// calls (e.g. a parallel tool batch) are serialized through this mutex.
+let uiChain: Promise<void> = Promise.resolve();
 function withUILock<T>(fn: () => Promise<T>): Promise<T> {
-	return sharedUiLock.withLock(fn);
+	const prev = uiChain;
+	let release!: () => void;
+	uiChain = new Promise<void>((r) => {
+		release = r;
+	});
+	return prev.then(fn).finally(() => release());
 }
+
+const QUIZ_GUIDELINES = [
+	"quiz is GRADED; `ask` is not. If the question has a correct answer, use quiz. If you just need a preference, decision, or open-ended input, use `ask`. Never call quiz and `ask` in the same parallel batch.",
+	'correctAnswer is REQUIRED and is the option value, not a position number. Single-select: one string (e.g. "mercury"). Multi-select: an array of strings (e.g. ["belize", "niue"]). A value that matches no option is a hard error.',
+	"explanation is REQUIRED — always say why the correct answer is correct.",
+	"Multi-select is graded as an exact-set match: the user is correct only if they select every correct option and no incorrect ones. Set multiSelect: true only when more than one option is correct.",
+	"An 'I don't know' choice is ALWAYS added automatically — provide ONLY the real, gradable options (at least two). Never add your own opt-out option.",
+	"A dontKnow result means the user honestly did not know and did NOT guess — treat it as a genuine knowledge gap to teach into, not as a wrong answer.",
+	"Any answer may carry a free-text `note` from the user. When present it reflects what they were thinking — let it steer your follow-up.",
+	"Make each distractor a specific, believable mistake (a common misconception or an easily-confused neighbour) so WHICH wrong answer is picked tells you which gap to teach into. Every distractor must be unambiguously wrong on the intended reading — tempting, not tricky.",
+	"Don't let the correct answer stand out by form or formatting: keep options similar in length, specificity, phrasing, and emphasis.",
+	"Options are shuffled by default. Set shuffle: false only when option order is meaningful (ordered values, or an 'All/None of the above' option that must stay last).",
+	"Pass `concept` (the concept-note slug) when the question checks a concept being taught or reviewed; omit it for probe questions. Tagged results drive spaced-repetition scheduling.",
+	"To probe nuance, ask several quick quiz questions and adapt each one to the previous answers, rather than writing one giant question.",
+];
 
 export default function quiz(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "quiz",
 		label: "quiz",
+		// Essential: the teach skill calls quiz directly, not through xd:// discovery.
+		loadMode: "essential",
 		description:
-			"Ask the user a GRADED question with a known correct answer, then instantly grade and give feedback. Unlike ask_user_question (which collects preferences/decisions with no right answer), quiz always has a correct answer supplied by you, marks the user's selection right/wrong (✓/✗), reveals the correct answer, and can show an explanation. Use it to (1) assess what the learner already understands before teaching, and (2) run tight practice/retrieval loops after explaining, or probe understanding whenever you're unsure they've got it. Options-only: single-select or multi-select, plus an automatic 'I don't know' choice so the user can signal a genuine gap instead of guessing. An always-present optional note field (Tab to focus it) lets the user attach a free-text note to ANY answer; it reaches you only when non-empty. No free-text answers — for non-graded questions use ask_user_question instead.",
-		promptSnippet:
-			"Use the quiz tool to test the user with a graded multiple-choice or multi-select question (required correct answer + required explanation). For non-graded questions, use ask_user_question.",
-		promptGuidelines: [
-			"quiz is GRADED; ask_user_question is not. If the question has a correct answer, use quiz. If you just need a preference, decision, or open-ended input, use ask_user_question.",
-			'correctAnswer is REQUIRED and is the option value, not a position number. Single-select: one string (e.g. "mercury"). Multi-select: an array of strings (e.g. ["belize", "niue"]).',
-			"Always pass the option's `value` string as correctAnswer — it is self-checking and prevents miscounting positions. A value that matches no option is a hard error.",
-			"explanation is REQUIRED — always say why the correct answer is correct.",
-			"Multi-select is graded as an exact-set match: the user is correct only if they select every correct option and no incorrect ones.",
-			"There is no free-text mode. An 'I don't know' choice is ALWAYS added automatically — provide ONLY the real, gradable options (at least two). Never add your own uncertainty/opt-out option like 'I don't know', 'I'm not sure', or 'Not sure'; that is handled for you and a manual one would be redundant or gradable-as-wrong.",
-			"If a result comes back as dontKnow, the user honestly did not know and did NOT guess — treat it as a genuine knowledge gap to teach into, not as a wrong answer.",
-			"Any answer (right, wrong, or 'I don't know') may carry an optional free-text `note` the user typed in the always-present note field. When present it reflects what they were thinking or unsure about — read it and let it steer your follow-up. It is omitted entirely when empty.",
-			"Treat each wrong answer (distractor) as a diagnostic probe, not just filler: make it a specific, believable mistake the user might actually hold — a common misconception, or an adjacent/easily-confused concept — so that WHICH wrong answer they pick reveals WHICH nuance of their understanding is off. You learn far more from a targeted wrong choice than from a binary right/wrong, and the choice tells you exactly which gap to teach into next (and what the explanation should address).",
-			"Guardrail: every distractor must be unambiguously wrong on the intended reading — tempting, but a real error, not a defensible alternative. Don't drift into trick questions.",
-			"Anti-guessing hygiene: don't let the correct answer stand out by form (longest, most precise, most hedged, or the only one in the right format). Keep options similar in length, specificity, and phrasing so it can't be picked from shape alone.",
-			"Set multiSelect: true only when more than one option is correct.",
-			"Options are shuffled before display by default, so don't worry about which position you list the correct answer in. Set shuffle: false only when option order is meaningful (ordered values, or an 'All/None of the above' option that must stay last).",
-			"To probe nuance, ask several quick quiz questions and adapt each one based on the previous answers, rather than writing one giant question.",
-			"Don't leak the answer through formatting: keep option phrasing/length even and don't hint which is correct.",
-		],
-		parameters: QuizParams,
+			"Ask the user a GRADED question with a known correct answer, then instantly grade and give feedback. Unlike `ask` (which collects preferences/decisions with no right answer), quiz always has a correct answer supplied by you, marks the user's selection right/wrong (✓/✗), reveals the correct answer, and shows your explanation. Use it to (1) map what the learner already understands before teaching, (2) check that a concept landed, and (3) run spaced-repetition review. Options-only: single-select or multi-select, plus an automatic 'I don't know' choice. An optional note field (Tab to focus it) lets the user attach free text to ANY answer; it reaches you only when non-empty.\n\nGuidelines:\n" +
+			QUIZ_GUIDELINES.map((g) => `- ${g}`).join("\n"),
+		parameters: quizParams(pi.zod),
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const context = params.details?.trim() || undefined;
@@ -918,16 +925,9 @@ export default function quiz(pi: ExtensionAPI) {
 				options = shuffleOptions(options);
 			}
 
-			// Emit the true (post-shuffle) display order immediately, before the UI
-			// blocks on the user's answer. Listeners such as md-log rely on this to
-			// show the question in the SAME order the user actually sees it, instead
-			// of the pre-shuffle order the agent originally wrote in its tool call.
 			// Deliberately omits correctIndices/explanation — this fires before the
 			// user has answered and must not leak the answer.
-			onUpdate?.({
-				content: [{ type: "text", text: "Awaiting user response..." }],
-				details: { options: options.map((o, i) => ({ index: i + 1, label: o.label })) },
-			});
+			onUpdate?.({ content: [{ type: "text", text: "Awaiting user response..." }] });
 
 			const { indices: correctIndices, error: correctError } = resolveCorrect(
 				params.correctAnswer as string | string[],
@@ -952,10 +952,13 @@ export default function quiz(pi: ExtensionAPI) {
 				return unavailableResult(params.question, mode, `quiz ${correctError}`, correctIndices, context);
 			}
 
-			if (!ctx.hasUI) {
-				return unavailableResult(params.question, mode, "quiz requires interactive mode UI", correctIndices, context);
+			// custom() overlays exist only in the interactive TUI; hasUI alone does
+			// not guarantee them (RPC/ACP have UI but no custom()).
+			if (ctx.mode !== "tui") {
+				return unavailableResult(params.question, mode, "quiz requires the interactive omp TUI", correctIndices, context);
 			}
 
+			const concept = params.concept?.trim() || undefined;
 			return withUILock(async () => {
 				const response =
 					mode === "single-select"
@@ -964,7 +967,12 @@ export default function quiz(pi: ExtensionAPI) {
 				if (!response) {
 					return cancelledResult(params.question, mode, correctIndices, context);
 				}
-				return buildResult(params.question, context, mode, options, response, correctIndices, explanation);
+				const result = buildResult(params.question, context, mode, options, response, correctIndices, explanation);
+				if (concept) {
+					const warning = logConceptResult(ctx.cwd, concept, result.details);
+					if (warning) result.content.push({ type: "text" as const, text: warning });
+				}
+				return result;
 			});
 		},
 

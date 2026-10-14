@@ -1,74 +1,34 @@
 /**
  * visual-tools
  *
- * A self-contained pi extension that registers custom subagent tools with the
- * globally-loaded `interactive-subagents` extension — and does nothing else:
+ * omp extension providing the authoring loops for the two diagram-maker agents:
  *
- *   • write_mermaid / edit_mermaid / render_mermaid
- *       (tools/mermaid_tools.ts) — the mermaid-maker's authoring loop: write a
- *       Mermaid source, exact-match edit it, render whatever is currently in
- *       the managed file to a PNG (via the bundled @mermaid-js/mermaid-cli and
- *       an installed Chrome), return the PNG inline for inspection, and — when
- *       given `save_as` — publish it into <cwd>/viz with a unique name.
- *   • write_svg / edit_svg / render_svg
- *       (tools/svg_tools.ts) — the svg-maker's authoring loop: same shape, but
- *       renders hand-written SVG to a PNG via rsvg-convert (fallback: magick).
+ *   • write_mermaid / edit_mermaid / render_mermaid  (tools/mermaid_tools.ts)
+ *       mermaid-maker's loop: write a Mermaid source, exact-match edit it,
+ *       render it to a PNG (bundled @mermaid-js/mermaid-cli + installed Chrome)
+ *       and return the PNG inline for inspection. `final: true` also returns
+ *       the exact source in a ```mermaid fence for the maker to hand back.
+ *   • write_svg / edit_svg / render_svg  (tools/svg_tools.ts)
+ *       svg-maker's loop: same shape for hand-written SVG, rasterized by
+ *       headless Chrome. `save_as` copies the SVG source into <cwd>/assets.
  *
- * Each trio maps to ONE file so interactive-subagents loads it once and
- * allow-lists all three names.
+ * All six tools are registered with `defaultInactive: true`: the main agent
+ * never sees them; only agents that list them in their `tools:` frontmatter
+ * (agents/mermaid-maker.md, agents/svg-maker.md) get them.
  *
- * ── How registration reaches interactive-subagents ──────────────────────────
- * The global `interactive-subagents` extension exposes `registerToolExtension`
- * on `globalThis.__pi_interactive_subagents`. A child subagent is launched with
- * `--no-extensions` plus an explicit `-e <path>` only for tools whose name →
- * path mapping it knows; this extension teaches it about the six names above so
- * mermaid-maker / svg-maker (which list them in their `tools:` frontmatter) get
- * them loaded into their child process.
+ * omp runs this factory once per session (subagents included), so each register
+ * function keeps its managed source file in its own closure — parallel makers
+ * in one process never clobber each other.
  *
- * pi loads PROJECT-local extensions (this one) BEFORE global ones, so
- * `globalThis.__pi_interactive_subagents` does not exist yet when this factory
- * runs. We defer registration to `session_start`, which fires once after every
- * extension's factory has run. Registration is idempotent (same name+path is a
- * no-op), so `/reload` or a "reload"/"new"/"resume" session_start is harmless.
+ * Setup: `bun install` in this directory (installs mmdc; bun skips puppeteer's
+ * browser download, and rendering uses the installed Google Chrome).
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
-import * as fs from "node:fs"
-import * as path from "node:path"
-import { fileURLToPath } from "node:url"
+import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent"
+import { registerMermaidTools } from "./tools/mermaid_tools.ts"
+import { registerSvgTools } from "./tools/svg_tools.ts"
 
-const EXT_DIR = path.dirname(fileURLToPath(import.meta.url))
-const MERMAID_TOOLS = path.join(EXT_DIR, "tools", "mermaid_tools.ts")
-const SVG_TOOLS = path.join(EXT_DIR, "tools", "svg_tools.ts")
-
-interface InteractiveSubagentsApi {
-  registerToolExtension: (name: string, extensionPath: string) => void
-}
-
-function registerToolExtensions(): void {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const api = (globalThis as any).__pi_interactive_subagents as InteractiveSubagentsApi | undefined
-  if (!api?.registerToolExtension) return // interactive-subagents not loaded — no-op
-
-  for (const [name, toolPath] of [
-    ["write_mermaid", MERMAID_TOOLS],
-    ["edit_mermaid", MERMAID_TOOLS],
-    ["render_mermaid", MERMAID_TOOLS],
-    ["write_svg", SVG_TOOLS],
-    ["edit_svg", SVG_TOOLS],
-    ["render_svg", SVG_TOOLS],
-  ] as const) {
-    if (!fs.existsSync(toolPath)) continue
-    try {
-      api.registerToolExtension(name, toolPath)
-    } catch {
-      // Already registered under a different path, or re-registered — ignore.
-    }
-  }
-}
-
-export default function (pi: ExtensionAPI) {
-  pi.on("session_start", async () => {
-    registerToolExtensions()
-  })
+export default function visualTools(pi: ExtensionAPI): void {
+  registerMermaidTools(pi)
+  registerSvgTools(pi)
 }

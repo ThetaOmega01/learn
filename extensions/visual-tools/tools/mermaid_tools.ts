@@ -1,59 +1,58 @@
 /**
- * Mermaid authoring loop for the mermaid-maker subagent — three tools that
- * share one session-scoped source file:
+ * Mermaid authoring loop for the mermaid-maker agent — three tools sharing one
+ * session-scoped source file:
  *
  *   write_mermaid   — write the full Mermaid source to the session's file
- *   edit_mermaid    — exact-match old_text→new_text on that file (pi-edit semantics)
+ *   edit_mermaid    — exact-match old_text→new_text on that file
  *   render_mermaid  — render whatever is in the file → PNG, returned inline;
- *                     with `save_as`, also publish it into <cwd>/viz
+ *                     with `final: true`, also return the exact source text in
+ *                     a ```mermaid fence for the maker to hand back verbatim
  *
- * Bundled inside the visual-tools extension and exposed to subagents via the
- * interactive-subagents `registerToolExtension` hook (see ../index.ts). NOT a
- * global pi extension — loaded by the spawned child pi process for any subagent
- * whose `tools:` frontmatter includes these names (currently just
- * mermaid-maker). All three names map to this one file.
+ * Nothing is ever written into the project: the caller embeds the returned
+ * Mermaid source directly in its note.
  *
  * Rendering shells out to the bundled @mermaid-js/mermaid-cli (`mmdc`) with a
  * puppeteer config pointing at an installed Chrome, so no Chromium download is
- * needed. Module-level session state persists across this child process's tool
- * calls and is naturally isolated from any parallel maker (different process).
+ * needed.
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
-import { Type } from "@sinclair/typebox"
+import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent"
+import { existsSync, readFileSync, writeFileSync } from "node:fs"
+import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 import {
   applyEdit,
-  dirname,
-  existsSync,
   findChrome,
-  join,
-  mkdirSync,
-  publish,
-  readFileSync,
   run,
   type Session,
   snippetAround,
+  tailOutput,
+  type ToolContent,
+  newSession,
   writeBody,
-  writeFileSync,
 } from "./_common.ts"
 
-const TOOL_DIR = dirname(fileURLToPath(import.meta.url))
-const EXTENSION_DIR = dirname(TOOL_DIR)
+const EXTENSION_DIR = dirname(dirname(fileURLToPath(import.meta.url)))
 const MMDC_BIN = join(EXTENSION_DIR, "node_modules", ".bin", "mmdc")
-const GROUP = "mermaid"
-const BODY_FILE = "diagram.mmd"
 const RENDER_TIMEOUT_MS = 120_000
 
-type RenderDetails = { ok: boolean; path: string; filename?: string }
+export function registerMermaidTools(pi: ExtensionAPI): void {
+  const z = pi.zod
+  // Per-session: this function runs once per omp session, so parallel makers never share a file.
+  const session: Session = newSession("mermaid", "diagram.mmd")
+  let hasSource = false
 
-let session: Session | null = null
+  const requireSource = (tool: string): void => {
+    if (!hasSource || !existsSync(session.bodyPath)) {
+      throw new Error(`${tool}: no source yet — call write_mermaid first.`)
+    }
+  }
 
-export default function mermaidToolsExtension(pi: ExtensionAPI) {
   // ── write_mermaid ──────────────────────────────────────────────────────────
   pi.registerTool({
     name: "write_mermaid",
     label: "Write Mermaid",
+    defaultInactive: true,
     description:
       "Write the FULL Mermaid source to this session's managed file (your first " +
       "draft or a complete rewrite). You do NOT name the file — edit_mermaid and " +
@@ -62,15 +61,16 @@ export default function mermaidToolsExtension(pi: ExtensionAPI) {
       "flow, `sequenceDiagram`, `stateDiagram-v2`, `erDiagram`, `classDiagram`, " +
       "`mindmap`, or `timeline`. Writing does NOT render — call render_mermaid " +
       "when ready. For a small fix, prefer edit_mermaid over rewriting.",
-    parameters: Type.Object({
-      source: Type.String({
-        description: "The complete Mermaid diagram source (starts with the diagram type, e.g. `graph TD`).",
-      }),
+    parameters: z.object({
+      source: z
+        .string()
+        .describe("The complete Mermaid diagram source (starts with the diagram type, e.g. `graph TD`)."),
     }),
     async execute(_id, params) {
       const source = (params.source ?? "").trim()
       if (!source) throw new Error("`write_mermaid` requires a non-empty `source`.")
-      session = writeBody(GROUP, BODY_FILE, source)
+      writeBody(session, source)
+      hasSource = true
       const lines = source.split("\n").length
       return {
         content: [
@@ -88,26 +88,29 @@ export default function mermaidToolsExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "edit_mermaid",
     label: "Edit Mermaid",
+    defaultInactive: true,
     description:
       "Make a single exact-match replacement in this session's Mermaid source — " +
-      "the same contract as pi's built-in edit, locked to the one managed file. " +
+      "the same contract as the built-in edit, locked to the one managed file. " +
       "`old_text` must appear EXACTLY ONCE (include surrounding context for " +
       "uniqueness); on 0 or >1 matches the call fails and nothing changes. Call " +
       "write_mermaid first. Editing does NOT render.",
-    parameters: Type.Object({
-      old_text: Type.String({ description: "Exact substring of the current source to replace (must match once)." }),
-      new_text: Type.String({ description: "Replacement text for `old_text`." }),
+    parameters: z.object({
+      old_text: z.string().describe("Exact substring of the current source to replace (must match once)."),
+      new_text: z.string().describe("Replacement text for `old_text`."),
     }),
     async execute(_id, params) {
-      if (!session || !existsSync(session.bodyPath)) {
-        throw new Error("edit_mermaid: no source yet — call write_mermaid first.")
-      }
+      requireSource("edit_mermaid")
       const current = readFileSync(session.bodyPath, "utf8")
       const { updated, index } = applyEdit(current, String(params.old_text ?? ""), String(params.new_text ?? ""))
       writeFileSync(session.bodyPath, updated, "utf8")
       return {
         content: [
-          { type: "text", text: "Applied edit. Updated region:\n```\n" + snippetAround(updated, index) + "\n```\nCall render_mermaid to see it." },
+          {
+            type: "text",
+            text:
+              "Applied edit. Updated region:\n```\n" + snippetAround(updated, index) + "\n```\nCall render_mermaid to see it.",
+          },
         ],
         details: { ok: true, path: session.bodyPath },
       }
@@ -118,31 +121,43 @@ export default function mermaidToolsExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "render_mermaid",
     label: "Render Mermaid",
+    defaultInactive: true,
     description:
       "Render the CURRENT session Mermaid source to a PNG and return it inline so " +
       "you can SEE the diagram and iterate. You do NOT pass the source here — it " +
       "comes from the managed file; call write_mermaid first.\n\n" +
-      "Iterate freely with no `save_as` (preview only). When the diagram is " +
-      "correct and clean, call once more with `save_as` set to a short kebab-case " +
-      "topic slug: that publishes the PNG into <cwd>/viz with a unique " +
-      "filename and returns the filename to embed. On a render error this returns " +
-      "the error text instead of an image — fix with edit_mermaid and re-render.",
-    parameters: Type.Object({
-      save_as: Type.Optional(
-        Type.String({
-          description:
-            "Short kebab-case topic slug (e.g. 'internet-packets'). When set, the " +
-            "rendered PNG is published to <cwd>/viz as viz-<slug>-<timestamp>.png " +
-            "and the filename is returned. Omit for a preview-only render.",
-        }),
-      ),
+      "Iterate freely without `final` (preview only). When the diagram is correct " +
+      "and clean, call once more with `final: true`: that renders it one last time " +
+      "and returns the exact current source in a ```mermaid fence, which you must " +
+      "return verbatim. Nothing is written into the project. On a render error " +
+      "this returns the error text instead of an image — fix with edit_mermaid and " +
+      "re-render.",
+    parameters: z.object({
+      final: z
+        .boolean()
+        .optional()
+        .describe(
+          "Set true once the diagram is correct and clean: returns the exact current " +
+            "source in a ```mermaid fence for you to return verbatim. Omit for a preview.",
+        ),
     }),
-    async execute(_id, params) {
-      if (!session || !existsSync(session.bodyPath)) {
-        throw new Error("render_mermaid: no source yet — call write_mermaid first.")
-      }
+    async execute(_id, params, signal) {
+      requireSource("render_mermaid")
       const { workDir, bodyPath } = session
-      mkdirSync(workDir, { recursive: true })
+
+      if (!existsSync(MMDC_BIN)) {
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `Mermaid render unavailable: ${MMDC_BIN} is missing. ` +
+                `Tell the user to run \`bun install\` in ${EXTENSION_DIR}.`,
+            },
+          ],
+          details: { ok: false },
+        }
+      }
 
       const chrome = findChrome()
       const cfgPath = join(workDir, "puppeteer.json")
@@ -153,45 +168,51 @@ export default function mermaidToolsExtension(pi: ExtensionAPI) {
       )
 
       const outPath = join(workDir, `render-${Date.now()}.png`)
-      const res = await run(
-        MMDC_BIN,
-        ["-i", bodyPath, "-o", outPath, "-p", cfgPath, "-s", "2", "-b", "white"],
-        { cwd: workDir, timeoutMs: RENDER_TIMEOUT_MS, env: { PUPPETEER_SKIP_DOWNLOAD: "1" } },
-      )
+      const res = await run(MMDC_BIN, ["-i", bodyPath, "-o", outPath, "-p", cfgPath, "-s", "2", "-b", "white"], {
+        cwd: workDir,
+        timeoutMs: RENDER_TIMEOUT_MS,
+        env: { PUPPETEER_SKIP_DOWNLOAD: "1" },
+        signal,
+      })
 
       if (res.code !== 0 || !existsSync(outPath)) {
-        const detail = (res.stderr || res.stdout || "unknown error").split("\n").slice(-30).join("\n")
         const note = res.timedOut ? "mmdc timed out.\n\n" : ""
         return {
           content: [
             {
               type: "text",
-              text: `${note}Mermaid render FAILED — no image produced. Fix the source with edit_mermaid and call render_mermaid again.\n\nError:\n${detail}`,
+              text: `${note}Mermaid render FAILED — no image produced. Fix the source with edit_mermaid and call render_mermaid again.\n\nError:\n${tailOutput(res)}`,
             },
           ],
-          details: { ok: false, path: "" } as RenderDetails,
+          details: { ok: false },
         }
       }
 
-      const data = readFileSync(outPath).toString("base64")
-      const content: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }> = []
+      const image = { type: "image" as const, data: readFileSync(outPath).toString("base64"), mimeType: "image/png" }
+      const content: ToolContent = []
 
-      if (params.save_as) {
-        const { filename, path } = publish(outPath, String(params.save_as))
+      if (params.final) {
+        const source = readFileSync(bodyPath, "utf8")
         content.push({
           type: "text",
-          text: `Published to viz/.\nfilename: ${filename}\npath: ${path}\n\nLOOK at the diagram below to confirm it is correct before returning it.`,
+          text:
+            "Final render. LOOK at the diagram below to confirm it is correct. If it is, " +
+            "return EXACTLY this source, verbatim, as your RESULT:\n\n```mermaid\n" +
+            source +
+            "\n```",
         })
-        content.push({ type: "image", data, mimeType: "image/png" })
-        return { content, details: { ok: true, path, filename } as RenderDetails }
+        content.push(image)
+        return { content, details: { ok: true, path: outPath, final: true } }
       }
 
       content.push({
         type: "text",
-        text: "Preview render (not yet saved). LOOK: are arrows/relationships correct, labels right, nothing cramped? Fix with edit_mermaid, or re-render with `save_as` to publish.",
+        text:
+          "Preview render. LOOK: are arrows/relationships correct, labels right, nothing cramped? " +
+          "Fix with edit_mermaid, or re-render with `final: true` once it is right.",
       })
-      content.push({ type: "image", data, mimeType: "image/png" })
-      return { content, details: { ok: true, path: outPath } as RenderDetails }
+      content.push(image)
+      return { content, details: { ok: true, path: outPath } }
     },
   })
 }
